@@ -1,0 +1,185 @@
+name: PR — Build e Validação
+
+on:
+  pull_request:
+    branches: [main, develop]
+
+# Permissão para postar comentários no PR
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  validacao:
+    name: Validar Build e API
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 Checkout do código
+        uses: actions/checkout@v4
+
+      - name: ⚙️ Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      # ── ETAPA 1: Dependências ──────────────────────────────
+      - name: 📦 Instalar dependências
+        id: install
+        run: npm ci
+        continue-on-error: true
+
+      # ── ETAPA 2: Inicialização do app ──────────────────────
+      - name: 🔍 Verificar inicialização do app
+        id: boot
+        run: node -e "require('./src/app'); console.log('ok')"
+        continue-on-error: true
+
+      # ── ETAPA 3: Subir servidor ────────────────────────────
+      - name: 🚀 Subir servidor
+        id: server
+        run: |
+          node src/server.js &
+          echo "SERVER_PID=$!" >> $GITHUB_ENV
+          for i in $(seq 1 10); do
+            curl -s http://localhost:3000/ && break
+            sleep 1
+          done
+        continue-on-error: true
+
+      # ── ETAPA 4: Testes de endpoint ────────────────────────
+      - name: 🧪 Testar GET /
+        id: test_root
+        run: |
+          S=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/)
+          [ "$S" = "200" ] || exit 1
+        continue-on-error: true
+
+      - name: 🧪 Testar GET /api/usuarios
+        id: test_list
+        run: |
+          S=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/api/usuarios)
+          [ "$S" = "200" ] || exit 1
+        continue-on-error: true
+
+      - name: 🧪 Testar GET /api/usuarios/1
+        id: test_get
+        run: |
+          S=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/api/usuarios/1)
+          [ "$S" = "200" ] || exit 1
+        continue-on-error: true
+
+      - name: 🧪 Testar GET /api/usuarios/999 → 404
+        id: test_not_found
+        run: |
+          S=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/api/usuarios/999)
+          [ "$S" = "404" ] || exit 1
+        continue-on-error: true
+
+      - name: 🧪 Testar POST válido → 201
+        id: test_post_ok
+        run: |
+          S=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:3000/api/usuarios \
+            -H "Content-Type: application/json" \
+            -d '{"nome":"CI Bot","email":"ci@bot.com","idade":20}')
+          [ "$S" = "201" ] || exit 1
+        continue-on-error: true
+
+      - name: 🧪 Testar POST inválido → 400
+        id: test_post_bad
+        run: |
+          S=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:3000/api/usuarios \
+            -H "Content-Type: application/json" \
+            -d '{"nome":"","email":"nao-é-email","idade":-1}')
+          [ "$S" = "400" ] || exit 1
+        continue-on-error: true
+
+      - name: 🧪 Testar PUT → 200
+        id: test_put
+        run: |
+          S=$(curl -s -o /dev/null -w "%{http_code}" -X PUT http://localhost:3000/api/usuarios/1 \
+            -H "Content-Type: application/json" \
+            -d '{"nome":"Atualizado","email":"a@a.com","idade":30}')
+          [ "$S" = "200" ] || exit 1
+        continue-on-error: true
+
+      - name: 🧪 Testar DELETE → 204
+        id: test_delete
+        run: |
+          S=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE http://localhost:3000/api/usuarios/2)
+          [ "$S" = "204" ] || exit 1
+        continue-on-error: true
+
+      - name: 🛑 Encerrar servidor
+        if: always()
+        run: kill $SERVER_PID || true
+
+      # ── ETAPA 5: Montar e postar comentário no PR ──────────
+      - name: 💬 Postar comentário no PR
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const results = {
+              install:       '${{ steps.install.outcome }}',
+              boot:          '${{ steps.boot.outcome }}',
+              server:        '${{ steps.server.outcome }}',
+              test_root:     '${{ steps.test_root.outcome }}',
+              test_list:     '${{ steps.test_list.outcome }}',
+              test_get:      '${{ steps.test_get.outcome }}',
+              test_not_found:'${{ steps.test_not_found.outcome }}',
+              test_post_ok:  '${{ steps.test_post_ok.outcome }}',
+              test_post_bad: '${{ steps.test_post_bad.outcome }}',
+              test_put:      '${{ steps.test_put.outcome }}',
+              test_delete:   '${{ steps.test_delete.outcome }}',
+            };
+
+            const icon  = (r) => r === 'success' ? '✅' : r === 'skipped' ? '⏭️' : '❌';
+            const label = (r) => r === 'success' ? 'Passou' : r === 'skipped' ? 'Pulado' : 'Falhou';
+
+            const allPassed = Object.values(results).every(r => r === 'success');
+            const header = allPassed
+              ? '## ✅ Build e testes passaram!'
+              : '## ❌ Falha detectada no PR';
+
+            const sha     = context.payload.pull_request.head.sha.slice(0, 7);
+            const actor   = context.payload.pull_request.user.login;
+            const branch  = context.payload.pull_request.head.ref;
+
+            const rows = [
+              ['📦 Instalar dependências',        results.install],
+              ['🔍 Inicialização do app',          results.boot],
+              ['🚀 Servidor subiu',                results.server],
+              ['🔵 GET /  → 200',                  results.test_root],
+              ['🔵 GET /api/usuarios → 200',       results.test_list],
+              ['🔵 GET /api/usuarios/1 → 200',     results.test_get],
+              ['🟡 GET /api/usuarios/999 → 404',   results.test_not_found],
+              ['🟢 POST válido → 201',              results.test_post_ok],
+              ['🔴 POST inválido → 400',            results.test_post_bad],
+              ['🟠 PUT /api/usuarios/1 → 200',     results.test_put],
+              ['🗑️ DELETE /api/usuarios/2 → 204',  results.test_delete],
+            ].map(([name, r]) => `| ${icon(r)} | ${name} | ${label(r)} |`).join('\n');
+
+            const body = `
+            ${header}
+
+            | | Verificação | Status |
+            |---|---|---|
+            ${rows}
+
+            ---
+            🔀 **Branch:** \`${branch}\`
+            📝 **Commit:** \`${sha}\`
+            👤 **Autor:** @${actor}
+            🕐 **Rodou em:** ${new Date().toUTCString()}
+            `;
+
+            await github.rest.issues.createComment({
+              owner:      context.repo.owner,
+              repo:       context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body:       body.trim().replace(/^ {12}/gm, ''),
+            });
+
+            if (!allPassed) core.setFailed('Um ou mais testes falharam.');
